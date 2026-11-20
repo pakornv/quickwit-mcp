@@ -40,6 +40,16 @@ func TestNewServer_Integration(t *testing.T) {
 	if !strings.Contains(indexes, `"index_id":"quickwit-mcp-test"`) {
 		t.Fatalf("index not discovered: %s", indexes)
 	}
+	t.Run("filters indexes on Quickwit by prefix", func(t *testing.T) {
+		indexes := callSuccess(t, session, "list_indexes", map[string]any{"name_prefix": "quickwit-mcp", "name_contains": "MCP-TEST"})
+		if !strings.Contains(indexes, `"index_id":"quickwit-mcp-test"`) {
+			t.Errorf("filtered indexes = %s", indexes)
+		}
+		indexes = callSuccess(t, session, "list_indexes", map[string]any{"name_prefix": "Quickwit-mcp"})
+		if indexes != `{"indexes":[]}` {
+			t.Errorf("prefix should be case-sensitive: %s", indexes)
+		}
+	})
 	schema := callSuccess(t, session, "get_index_schema", map[string]any{"index_id": "quickwit-mcp-test"})
 	var index struct {
 		IndexID    string `json:"index_id"`
@@ -85,16 +95,42 @@ func TestNewServer_Integration(t *testing.T) {
 		})
 	}
 
+	t.Run("follows the advertised next page", func(t *testing.T) {
+		args := map[string]any{
+			"index_id": "quickwit-mcp-test", "query": "*", "start_timestamp": 1700000000,
+			"end_timestamp": 1700000120, "max_hits": 1, "oldest_first": true,
+		}
+		var page struct {
+			Hits []struct {
+				Log string `json:"log"`
+			} `json:"hits"`
+			NextOffset  *int `json:"next_offset"`
+			NextMaxHits *int `json:"next_max_hits"`
+		}
+		raw := callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(page.Hits) != 1 || page.Hits[0].Log != "first" ||
+			page.NextOffset == nil || *page.NextOffset != 1 || page.NextMaxHits == nil || *page.NextMaxHits != 1 {
+			t.Fatalf("first page = %s; error = %v", raw, err)
+		}
+		args["start_offset"], args["max_hits"] = *page.NextOffset, *page.NextMaxHits
+		raw = callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(page.Hits) != 1 || page.Hits[0].Log != "second" ||
+			page.NextOffset != nil || page.NextMaxHits != nil {
+			t.Errorf("final page = %s; error = %v", raw, err)
+		}
+	})
+
 	raw := callSuccess(t, session, "search", map[string]any{
 		"index_id": "quickwit-mcp-test", "query": "*",
 		"start_timestamp": 1700000000, "end_timestamp": 1700000120, "max_hits": 0,
 	})
 	var count struct {
-		NumHits    int               `json:"num_hits"`
-		Hits       []json.RawMessage `json:"hits"`
-		NextOffset *int              `json:"next_offset"`
+		NumHits     int               `json:"num_hits"`
+		Hits        []json.RawMessage `json:"hits"`
+		NextOffset  *int              `json:"next_offset"`
+		NextMaxHits *int              `json:"next_max_hits"`
 	}
-	if err := json.Unmarshal([]byte(raw), &count); err != nil || count.NumHits != 2 || len(count.Hits) != 0 || count.NextOffset != nil {
+	if err := json.Unmarshal([]byte(raw), &count); err != nil || count.NumHits != 2 || len(count.Hits) != 0 || count.NextOffset != nil || count.NextMaxHits != nil {
 		t.Errorf("count-only result = %s; error = %v", raw, err)
 	}
 }

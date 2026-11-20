@@ -127,6 +127,58 @@ func TestNewServer(t *testing.T) {
 		}
 	})
 
+	t.Run("filters large index catalogs by a case-sensitive prefix", func(t *testing.T) {
+		t.Parallel()
+		patterns := make(chan string, 2)
+		session := newSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			pattern := r.URL.Query().Get("index_id_patterns")
+			patterns <- pattern
+			if pattern == "" {
+				fmt.Fprintf(w, "[%s%s]", strings.Repeat(" ", 4*1024*1024), indexMetadata)
+				return
+			}
+			other := strings.Replace(indexMetadata, "logs-test", "Logs-TEST", 1)
+			fmt.Fprintf(w, "[%s,%s]", indexMetadata, other)
+		}))
+		callError(t, session, "list_indexes", map[string]any{"name_contains": "TEST"}, "response exceeds 4 MiB")
+		result := callSuccess(t, session, "list_indexes", map[string]any{"name_prefix": "logs-", "name_contains": "TEST"})
+		if !strings.Contains(result, `"index_id":"logs-test"`) || strings.Contains(result, "Logs-TEST") {
+			t.Errorf("filtered indexes = %s", result)
+		}
+		if first, second := <-patterns, <-patterns; first != "" || second != "logs-*" {
+			t.Errorf("upstream patterns = %q, %q", first, second)
+		}
+	})
+
+	t.Run("accepts a full-length index prefix", func(t *testing.T) {
+		t.Parallel()
+		prefix := "a" + strings.Repeat("b", 254)
+		patterns := make(chan string, 1)
+		session := newSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			patterns <- r.URL.Query().Get("index_id_patterns")
+			fmt.Fprintf(w, "[%s]", strings.Replace(indexMetadata, "logs-test", prefix, 1))
+		}))
+		result := callSuccess(t, session, "list_indexes", map[string]any{"name_prefix": prefix})
+		if !strings.Contains(result, prefix) || <-patterns != prefix {
+			t.Errorf("full-length prefix failed: %s", result)
+		}
+	})
+
+	t.Run("rejects invalid index prefixes before HTTP", func(t *testing.T) {
+		t.Parallel()
+		for _, prefix := range []string{"../logs", "logs-*", "logs,other", strings.Repeat("a", 256)} {
+			t.Run(prefix, func(t *testing.T) {
+				t.Parallel()
+				fake := &fakeQuickwit{index: indexMetadata}
+				session := newSession(t, fake)
+				callError(t, session, "list_indexes", map[string]any{"name_prefix": prefix}, "")
+				if reqs := fake.recorded(); len(reqs) != 0 {
+					t.Errorf("unexpected HTTP requests: %+v", reqs)
+				}
+			})
+		}
+	})
+
 	t.Run("searches and preserves partial errors and large numbers", func(t *testing.T) {
 		t.Parallel()
 		fake := &fakeQuickwit{index: indexMetadata, result: searchResult}
@@ -135,7 +187,7 @@ func TestNewServer(t *testing.T) {
 		args["max_hits"] = 1
 		args["start_offset"] = 1
 		result := callSuccess(t, session, "search", args)
-		for _, fragment := range []string{`"next_offset":2`, `"order_id":9007199254740993`, `"one split failed"`} {
+		for _, fragment := range []string{`"next_offset":2`, `"next_max_hits":1`, `"hits_truncated":false`, `"order_id":9007199254740993`, `"one split failed"`} {
 			if !strings.Contains(result, fragment) {
 				t.Errorf("search result %s missing %s", result, fragment)
 			}
@@ -147,6 +199,112 @@ func TestNewServer(t *testing.T) {
 		wantBody := map[string]any{"query": `log:"ORDER_ID"`, "start_timestamp": float64(100), "end_timestamp": float64(200), "max_hits": float64(1), "start_offset": float64(1), "sort_by": "timestamp"}
 		if reqs[0].method != "GET" || reqs[0].path != "/api/v1/indexes/logs-test" || reqs[1].method != "POST" || reqs[1].path != "/api/v1/logs-test/search" || !reflect.DeepEqual(reqs[1].body, wantBody) {
 			t.Errorf("requests = %+v", reqs)
+		}
+	})
+
+	t.Run("rejects more hits than requested", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name   string
+			max    int
+			result string
+		}{
+			{"count only", 0, `{"num_hits":1,"hits":[{"log":"sensitive-record"}]}`},
+			{"limited page", 1, `{"num_hits":2,"hits":[{"log":"sensitive-record"},{}]}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				session := newSession(t, &fakeQuickwit{index: indexMetadata, result: tc.result})
+				args := validSearch()
+				args["max_hits"] = tc.max
+				result := call(t, session, "search", args)
+				text := resultText(t, result)
+				if !result.IsError || !strings.Contains(text, "more hits than requested") || strings.Contains(text, "sensitive-record") {
+					t.Errorf("unexpected response: error=%v text=%s", result.IsError, text)
+				}
+			})
+		}
+	})
+
+	t.Run("limits search output and paginates without skipping hits", func(t *testing.T) {
+		t.Parallel()
+		message := strings.Repeat("<", 12000) + strings.Repeat("x", 20*1024)
+		session := newSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				fmt.Fprint(w, indexMetadata)
+				return
+			}
+			var req struct {
+				MaxHits     int `json:"max_hits"`
+				StartOffset int `json:"start_offset"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hits := make([]map[string]any, 0)
+			for id := req.StartOffset; id < min(req.StartOffset+req.MaxHits, 4); id++ {
+				hits = append(hits, map[string]any{"id": id, "log": message, "order_id": int64(9007199254740993)})
+			}
+			enc := json.NewEncoder(w)
+			enc.SetEscapeHTML(false)
+			_ = enc.Encode(map[string]any{"num_hits": 4, "hits": hits, "errors": []string{"one split failed"}})
+		}))
+		args := validSearch()
+		args["max_hits"] = 3
+		var page struct {
+			Hits []struct {
+				ID int `json:"id"`
+			} `json:"hits"`
+			HitsTruncated bool     `json:"hits_truncated"`
+			NextOffset    *int     `json:"next_offset"`
+			NextMaxHits   *int     `json:"next_max_hits"`
+			Errors        []string `json:"errors"`
+		}
+		raw := callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(raw) > 256*1024 || len(page.Hits) != 2 ||
+			page.Hits[0].ID != 0 || page.Hits[1].ID != 1 || !page.HitsTruncated ||
+			page.NextOffset == nil || *page.NextOffset != 2 || page.NextMaxHits == nil || *page.NextMaxHits != 3 ||
+			!reflect.DeepEqual(page.Errors, []string{"one split failed"}) || !strings.Contains(raw, `"order_id":9007199254740993`) {
+			t.Fatalf("first page: length=%d hits=%v truncated=%v next=%v size=%v errors=%v unmarshal=%v", len(raw), page.Hits, page.HitsTruncated, page.NextOffset, page.NextMaxHits, page.Errors, err)
+		}
+		args["start_offset"], args["max_hits"] = *page.NextOffset, *page.NextMaxHits
+		raw = callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(raw) > 256*1024 || len(page.Hits) != 2 ||
+			page.Hits[0].ID != 2 || page.Hits[1].ID != 3 || page.HitsTruncated || page.NextOffset != nil || page.NextMaxHits != nil {
+			t.Fatalf("final page: length=%d hits=%v truncated=%v next=%v size=%v unmarshal=%v", len(raw), page.Hits, page.HitsTruncated, page.NextOffset, page.NextMaxHits, err)
+		}
+	})
+
+	t.Run("paginates truncated hits even when Quickwit undercounts", func(t *testing.T) {
+		t.Parallel()
+		hit := `{"log":"` + strings.Repeat("x", 100*1024) + `"}`
+		fake := &fakeQuickwit{index: indexMetadata, result: `{"num_hits":1,"hits":[` + hit + `,` + hit + `,` + hit + `],"errors":["one split failed"]}`}
+		session := newSession(t, fake)
+		args := validSearch()
+		args["max_hits"] = 3
+		result := callSuccess(t, session, "search", args)
+		if len(result) > 256*1024 || !strings.Contains(result, `"hits_truncated":true`) || !strings.Contains(result, `"next_offset":2`) {
+			t.Errorf("undercounted page: length=%d", len(result))
+		}
+	})
+
+	t.Run("rejects oversized individual hits or search metadata", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, result, message string
+			maxHits               int
+		}{
+			{"single hit", `{"num_hits":1,"hits":[{"log":"` + strings.Repeat("<", 50000) + `"}]}`, "single search hit exceeds", 1},
+			{"metadata", `{"num_hits":0,"hits":[],"errors":["` + strings.Repeat("x", 256*1024) + `"]}`, "search result metadata exceeds", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				session := newSession(t, &fakeQuickwit{index: indexMetadata, result: tc.result})
+				args := validSearch()
+				args["max_hits"] = tc.maxHits
+				callError(t, session, "search", args, tc.message)
+			})
 		}
 	})
 
@@ -183,13 +341,62 @@ func TestNewServer(t *testing.T) {
 					args[k] = v
 				}
 				result := callSuccess(t, session, "search", args)
-				if !strings.Contains(result, `"next_offset":null`) {
+				if !strings.Contains(result, `"next_offset":null`) || !strings.Contains(result, `"next_max_hits":null`) {
 					t.Errorf("result = %s", result)
 				}
 				if tc.name == "count only" && fake.recorded()[1].body["max_hits"] != float64(0) {
 					t.Errorf("explicit zero replaced by default")
 				}
 			})
+		}
+	})
+
+	t.Run("paginates to the ceiling using the advertised next page size", func(t *testing.T) {
+		t.Parallel()
+		type request struct {
+			MaxHits     int `json:"max_hits"`
+			StartOffset int `json:"start_offset"`
+		}
+		requests := make(chan request, 2)
+		session := newSession(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/indexes/logs-test" {
+				fmt.Fprint(w, indexMetadata)
+				return
+			}
+			if r.URL.Path != "/api/v1/logs-test/search" || r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			var req request
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			requests <- req
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"num_hits": 10005, "hits": make([]struct{}, req.MaxHits), "errors": []any{},
+			})
+		}))
+		args := validSearch()
+		args["start_offset"], args["max_hits"] = 9970, 20
+		var page struct {
+			Hits        []json.RawMessage `json:"hits"`
+			NextOffset  *int              `json:"next_offset"`
+			NextMaxHits *int              `json:"next_max_hits"`
+		}
+		raw := callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(page.Hits) != 20 ||
+			page.NextOffset == nil || *page.NextOffset != 9990 || page.NextMaxHits == nil || *page.NextMaxHits != 10 {
+			t.Fatalf("first page = %s; error = %v", raw, err)
+		}
+		args["start_offset"], args["max_hits"] = *page.NextOffset, *page.NextMaxHits
+		raw = callSuccess(t, session, "search", args)
+		if err := json.Unmarshal([]byte(raw), &page); err != nil || len(page.Hits) != 10 ||
+			page.NextOffset != nil || page.NextMaxHits != nil {
+			t.Fatalf("final page = %s; error = %v", raw, err)
+		}
+		if first, second := <-requests, <-requests; first != (request{20, 9970}) || second != (request{10, 9990}) {
+			t.Errorf("upstream requests = %+v, %+v", first, second)
 		}
 	})
 
@@ -300,6 +507,30 @@ func TestNewServer(t *testing.T) {
 				args := validSearch()
 				args[tc.key] = tc.value
 				callError(t, session, "search", args, "")
+				if reqs := fake.recorded(); len(reqs) != 0 {
+					t.Errorf("unexpected HTTP requests: %+v", reqs)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects unknown arguments before HTTP", func(t *testing.T) {
+		t.Parallel()
+		searchArgs := validSearch()
+		searchArgs["max_hit"] = 0
+		for _, tc := range []struct {
+			tool string
+			args map[string]any
+		}{
+			{"list_indexes", map[string]any{"name_contain": "TEST"}},
+			{"get_index_schema", map[string]any{"index_id": "logs-test", "extra": true}},
+			{"search", searchArgs},
+		} {
+			t.Run(tc.tool, func(t *testing.T) {
+				t.Parallel()
+				fake := &fakeQuickwit{index: indexMetadata, result: searchResult}
+				session := newSession(t, fake)
+				callError(t, session, tc.tool, tc.args, "")
 				if reqs := fake.recorded(); len(reqs) != 0 {
 					t.Errorf("unexpected HTTP requests: %+v", reqs)
 				}
